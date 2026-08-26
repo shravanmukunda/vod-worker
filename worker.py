@@ -303,6 +303,7 @@ def process_job(job: dict[str, Any]) -> None:
         return
 
     set_session_status(session_id, "UPLOADING")
+    published = 0
     for clip in clips:
         raw_path = clip.get("_path")
         if not raw_path:
@@ -322,9 +323,14 @@ def process_job(job: dict[str, Any]) -> None:
                 "durationSeconds": clip.get("_cut_duration"),
             },
         )
+        published += 1
         log(f"published {clip['vodId']} -> {key}")
 
     set_session_status(session_id, "DONE")
+    log(
+        f"completed publishing all clips for session {session_id}: "
+        f"{published}/{len(clips)} published"
+    )
     shutil.rmtree(session_dir, ignore_errors=True)
 
 
