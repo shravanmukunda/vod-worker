@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll Tourney for queued court VODs, cut matches, upload MP4s to R2."""
+"""Poll Tourney for queued court VODs, cut matches, upload to R2 and YouTube."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
+
+from youtube_upload import build_description, build_title, upload_video, youtube_enabled
 
 load_dotenv()
 
@@ -38,12 +40,44 @@ R2_BUCKET = os.environ.get("R2_BUCKET", "")
 R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_REGION = os.environ.get("R2_REGION", "auto")
+YOUTUBE_PRIVACY = os.environ.get("YOUTUBE_PRIVACY", "private").strip().lower()
 
 HEADERS = {"X-Vod-Worker-Token": TOKEN, "Content-Type": "application/json"}
 
 
+PROGRESS_INTERVAL_SEC = float(os.environ.get("PROGRESS_INTERVAL_SEC", "2"))
+
+
 def log(message: str) -> None:
     print(message, flush=True)
+
+
+def format_hms(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def format_bytes(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            if unit == "B":
+                return f"{int(size)}{unit}"
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}GiB"
+
+
+def progress_line(message: str, *, done: bool = False) -> None:
+    if done:
+        sys.stderr.write("\r" + message + "\n")
+    else:
+        sys.stderr.write("\r" + message.ljust(100))
+    sys.stderr.flush()
 
 
 def api_get(path: str) -> requests.Response:
@@ -79,6 +113,83 @@ def run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[st
     return subprocess.run(cmd, check=check, text=True)
 
 
+def run_ytdlp(cmd: list[str]) -> int:
+    log("$ " + " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        if "[download]" in stripped:
+            detail = stripped.split("[download]", 1)[-1].strip()
+            progress_line(f"[download] {detail}")
+        elif stripped.startswith("[") or "Extracting cookies" in stripped:
+            progress_line("", done=True)
+            log(stripped)
+    progress_line("", done=True)
+    return proc.wait()
+
+
+def run_ffmpeg_progress(cmd: list[str], *, label: str, expected_duration_sec: float) -> None:
+    log("$ " + " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    last_emit = 0.0
+    out_time_sec = 0.0
+    speed = ""
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        stripped = line.strip()
+        if not stripped or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        if key == "out_time_ms":
+            try:
+                out_time_sec = int(value) / 1_000_000
+            except ValueError:
+                pass
+        elif key == "speed":
+            speed = value.strip()
+        elif key == "progress" and value.strip() == "end":
+            break
+
+        now = time.monotonic()
+        if now - last_emit < PROGRESS_INTERVAL_SEC:
+            continue
+        last_emit = now
+        if expected_duration_sec > 0:
+            pct = min(100.0, 100.0 * out_time_sec / expected_duration_sec)
+            msg = (
+                f"{label} {pct:5.1f}% "
+                f"{format_hms(out_time_sec)}/{format_hms(expected_duration_sec)}"
+            )
+        else:
+            msg = f"{label} {format_hms(out_time_sec)} encoded"
+        if speed:
+            msg += f" speed={speed}"
+        progress_line(msg)
+
+    stderr = proc.stderr.read() if proc.stderr else ""
+    return_code = proc.wait()
+    progress_line("", done=True)
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, cmd, stderr=stderr)
+    log(f"{label} done")
+
+
 def yt_dlp_base_cmd() -> list[str]:
     cmd = [YTDLP]
     if YTDLP_COOKIES_FROM_BROWSER:
@@ -95,13 +206,14 @@ def download_source(video_id: str, dest: Path) -> None:
     if dest.exists() and dest.stat().st_size > 1024 * 1024 and probe_duration(dest) > 60:
         log(f"reusing {dest}")
         return
-    result = run(
+    return_code = run_ytdlp(
         yt_dlp_base_cmd()
         + [
             "-f",
             "bv*[height<=1080]+ba/b[height<=1080]/b",
             "--merge-output-format",
             "mp4",
+            "--newline",
             # HLS/MPEG-TS fixup often exits 1 after a long download even when the
             # file is already usable; prefer keeping the downloaded media.
             "--fixup",
@@ -109,9 +221,9 @@ def download_source(video_id: str, dest: Path) -> None:
             "-o",
             str(dest),
             f"https://www.youtube.com/watch?v={video_id}",
-        ],
-        check=False,
+        ]
     )
+    result = subprocess.CompletedProcess([], return_code)
     if result.returncode == 0 and dest.exists() and dest.stat().st_size > 1024:
         return
     # yt-dlp may exit non-zero after FixupM3u8 / skipped fragments while still
@@ -150,11 +262,20 @@ def probe_duration(path: Path) -> float:
         return 0.0
 
 
-def cut_clip(src: Path, dest: Path, start: float, end: float) -> None:
+def cut_clip(
+    src: Path,
+    dest: Path,
+    start: float,
+    end: float,
+    *,
+    label: str = "cut",
+) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    run(
+    expected_duration = max(0.0, end - start)
+    run_ffmpeg_progress(
         [
             FFMPEG,
+            "-hide_banner",
             "-y",
             "-ss",
             f"{start:.3f}",
@@ -174,8 +295,15 @@ def cut_clip(src: Path, dest: Path, start: float, end: float) -> None:
             "aac",
             "-movflags",
             "+faststart",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-loglevel",
+            "error",
             str(dest),
-        ]
+        ],
+        label=label,
+        expected_duration_sec=expected_duration,
     )
 
 
@@ -209,11 +337,12 @@ def storage_key(job: dict[str, Any], clip: dict[str, Any]) -> str:
     return f"vod/{tournament_id}/{fixture_id}.mp4"
 
 
-def upload_r2(path: Path, key: str, *, attempts: int = 3) -> None:
+def upload_r2(path: Path, key: str, *, attempts: int = 3, label: str = "upload") -> None:
     from boto3.s3.transfer import TransferConfig
 
     client = r2_client()
     extra = {"ContentType": "video/mp4"}
+    total_bytes = path.stat().st_size
     # Prefer a seekable file body over upload_file's internal stream wrapping.
     transfer = TransferConfig(
         multipart_threshold=64 * 1024 * 1024,
@@ -224,6 +353,22 @@ def upload_r2(path: Path, key: str, *, attempts: int = 3) -> None:
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
+            uploaded = 0
+            last_emit = 0.0
+
+            def on_progress(bytes_amount: int) -> None:
+                nonlocal uploaded, last_emit
+                uploaded += bytes_amount
+                now = time.monotonic()
+                if now - last_emit < PROGRESS_INTERVAL_SEC:
+                    return
+                last_emit = now
+                pct = min(100.0, 100.0 * uploaded / total_bytes) if total_bytes else 0.0
+                progress_line(
+                    f"{label} {pct:5.1f}% "
+                    f"{format_bytes(uploaded)}/{format_bytes(total_bytes)}"
+                )
+
             with path.open("rb") as handle:
                 client.upload_fileobj(
                     handle,
@@ -231,7 +376,9 @@ def upload_r2(path: Path, key: str, *, attempts: int = 3) -> None:
                     key,
                     ExtraArgs=extra,
                     Config=transfer,
+                    Callback=on_progress,
                 )
+            progress_line("", done=True)
             log(f"uploaded s3://{R2_BUCKET}/{key}")
             return
         except Exception as exc:  # noqa: BLE001
@@ -241,6 +388,69 @@ def upload_r2(path: Path, key: str, *, attempts: int = 3) -> None:
                 time.sleep(min(30, 2 ** attempt))
     assert last_exc is not None
     raise last_exc
+
+
+def download_r2(key: str, dest: Path, *, label: str = "download") -> None:
+    client = r2_client()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    total_bytes = 0
+    last_emit = 0.0
+    downloaded = 0
+
+    def on_progress(bytes_amount: int) -> None:
+        nonlocal downloaded, last_emit
+        downloaded += bytes_amount
+        now = time.monotonic()
+        if now - last_emit < PROGRESS_INTERVAL_SEC:
+            return
+        last_emit = now
+        if total_bytes > 0:
+            pct = min(100.0, 100.0 * downloaded / total_bytes)
+            progress_line(f"{label} {pct:5.1f}% {format_bytes(downloaded)}/{format_bytes(total_bytes)}")
+        else:
+            progress_line(f"{label} {format_bytes(downloaded)}")
+
+    with dest.open("wb") as handle:
+        client.download_fileobj(R2_BUCKET, key, handle, Callback=on_progress)
+    progress_line("", done=True)
+    log(f"downloaded s3://{R2_BUCKET}/{key} -> {dest}")
+
+
+def upload_youtube_clip(
+    path: Path,
+    *,
+    clip: dict[str, Any],
+    job: dict[str, Any],
+    label: str,
+) -> str:
+    vod = {
+        **clip,
+        "tournamentName": job.get("tournamentName"),
+        "tournamentId": job.get("tournamentId"),
+        "courtName": job.get("courtName"),
+    }
+    title = build_title(vod)
+    description = build_description(vod)
+    log(f"{label} title: {title}")
+
+    def on_progress(pct: float) -> None:
+        progress_line(f"{label} {pct:5.1f}%")
+
+    video_id = upload_video(
+        path,
+        title=title,
+        description=description,
+        privacy=YOUTUBE_PRIVACY,
+        on_progress=on_progress,
+    )
+    progress_line("", done=True)
+    log(f"{label} https://www.youtube.com/watch?v={video_id}")
+    if YOUTUBE_PRIVACY == "private":
+        log(
+            "Note: YouTube API cannot set members-only visibility. "
+            "In YouTube Studio, edit each video → Visibility → Members-only."
+        )
+    return video_id
 
 
 def process_job(job: dict[str, Any]) -> None:
@@ -265,12 +475,17 @@ def process_job(job: dict[str, Any]) -> None:
     session_dir.mkdir(parents=True, exist_ok=True)
     source = session_dir / "day.mp4"
 
+    clip_count = len(clips)
+    log(f"session {session_id}: {clip_count} clip(s) to process")
+
     set_session_status(session_id, "DOWNLOADING")
+    log(f"[1/4 download] fetching YouTube video {video_id}")
     download_source(video_id, source)
     duration = probe_duration(source)
+    log(f"[1/4 download] source ready ({format_hms(duration)}, {format_bytes(source.stat().st_size)})")
 
     set_session_status(session_id, "CUTTING")
-    for clip in clips:
+    for clip_index, clip in enumerate(clips, start=1):
         vod_id = clip["vodId"]
         start = max(0.0, float(clip["sourceOffsetStartSec"]) - pad_before)
         end = float(clip["sourceOffsetEndSec"]) + pad_after
@@ -289,11 +504,19 @@ def process_job(job: dict[str, Any]) -> None:
             continue
         out = session_dir / f"{vod_id}.mp4"
         if out.exists() and out.stat().st_size > 1024:
-            log(f"reusing {out}")
+            log(
+                f"[2/4 cut] clip {clip_index}/{clip_count} {vod_id[:8]} "
+                f"reusing {out.name} ({format_bytes(out.stat().st_size)})"
+            )
             clip["_path"] = str(out)
             clip["_cut_duration"] = int(max(1, probe_duration(out) or (end - start)))
             continue
-        cut_clip(source, out, start, end)
+        cut_label = (
+            f"[2/4 cut] clip {clip_index}/{clip_count} {vod_id[:8]} "
+            f"({format_hms(end - start)})"
+        )
+        log(cut_label)
+        cut_clip(source, out, start, end, label=cut_label)
         clip["_path"] = str(out)
         clip["_cut_duration"] = int(max(1, end - start))
 
@@ -303,8 +526,10 @@ def process_job(job: dict[str, Any]) -> None:
         return
 
     set_session_status(session_id, "UPLOADING")
+    upload_targets = [clip for clip in clips if clip.get("_path")]
+    upload_count = len(upload_targets)
     published = 0
-    for clip in clips:
+    for clip_index, clip in enumerate(upload_targets, start=1):
         raw_path = clip.get("_path")
         if not raw_path:
             log(f"skipping upload for {clip.get('vodId')}: no cut file (invalid/missing window)")
@@ -314,7 +539,12 @@ def process_job(job: dict[str, Any]) -> None:
             log(f"skipping upload for {clip.get('vodId')}: not a file ({path})")
             continue
         key = storage_key(job, clip)
-        upload_r2(path, key)
+        upload_label = (
+            f"[3/4 upload] clip {clip_index}/{upload_count} {clip['vodId'][:8]} "
+            f"({format_bytes(path.stat().st_size)})"
+        )
+        log(upload_label)
+        upload_r2(path, key, label=upload_label)
         patch_vod(
             clip["vodId"],
             {
@@ -325,6 +555,31 @@ def process_job(job: dict[str, Any]) -> None:
         )
         published += 1
         log(f"published {clip['vodId']} -> {key}")
+
+    if youtube_enabled():
+        set_session_status(session_id, "UPLOADING")
+        youtube_targets = [clip for clip in upload_targets if clip.get("_path")]
+        youtube_count = len(youtube_targets)
+        uploaded_youtube = 0
+        for clip_index, clip in enumerate(youtube_targets, start=1):
+            path = Path(clip["_path"])
+            youtube_label = (
+                f"[4/4 youtube] clip {clip_index}/{youtube_count} {clip['vodId'][:8]} "
+                f"({format_bytes(path.stat().st_size)})"
+            )
+            log(youtube_label)
+            video_id = upload_youtube_clip(path, clip=clip, job=job, label=youtube_label)
+            patch_vod(
+                clip["vodId"],
+                {
+                    "youtubeVideoId": video_id,
+                    "youtubePrivacy": YOUTUBE_PRIVACY,
+                },
+            )
+            uploaded_youtube += 1
+        log(f"uploaded {uploaded_youtube}/{youtube_count} clip(s) to YouTube")
+    else:
+        log("YouTube upload skipped (SKIP_YOUTUBE_UPLOAD or missing youtube_token.json)")
 
     set_session_status(session_id, "DONE")
     log(

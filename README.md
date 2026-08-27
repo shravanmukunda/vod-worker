@@ -39,6 +39,19 @@ You can also point `yt-dlp` at a cookies file directly:
 YTDLP_COOKIES_FILE=/absolute/path/to/cookies.txt
 ```
 
-Set `SKIP_YOUTUBE_UPLOAD=true` to only download and cut locally (writes files under `work/`; does not invent YouTube ids).
+Set `SKIP_R2_UPLOAD=true` to skip Cloudflare R2 and only cut locally.
+
+Set `SKIP_YOUTUBE_UPLOAD=true` to skip YouTube uploads (R2 only).
+
+After R2 upload, clips are uploaded to YouTube one-by-one with titles like
+`Home v Away | Tournament Name`. Default privacy is `private` (`YOUTUBE_PRIVACY`).
+YouTube's API cannot set **members-only** visibility — after upload, set that in
+YouTube Studio (Visibility → Members-only) for each clip.
+
+To backfill clips that are already in R2:
+
+```bash
+python youtube_backfill.py
+```
 
 The organiser **Process this stream** button sets the session to `QUEUED`. This process polls `GET /api/v1/internal/vod-jobs`.
